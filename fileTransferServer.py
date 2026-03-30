@@ -9,6 +9,8 @@ Part 2: Modify to support multiple concurrent clients (e.g. fork() or select()).
 import socket
 import sys
 import os
+import select
+import threading
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "lib"))
 import params
@@ -18,6 +20,7 @@ import framing
 switchesVarDefaults = (
     (('-l', '--listenPort'), 'listenPort', 50001),
     (('-d', '--directory'), 'directory', '.'),   # base directory for file requests
+    (('-m', '--mode'), 'mode', 'select'),        # 'select' (default) or 'threads'
     (('-?', '--usage'), 'usage', False),
 )
 
@@ -25,6 +28,7 @@ progname = "fileTransferServer"
 paramMap = params.parseParams(switchesVarDefaults)
 listenPort = paramMap['listenPort']
 directory = paramMap['directory']
+mode = str(paramMap.get('mode', 'select')).strip().lower()
 if paramMap['usage']:
     params.usage()
 
@@ -142,18 +146,165 @@ def main():
     # "backlog": how many pending connections the kernel may queue before
     # we accept() them. When a client connects, the kernel completes the TCP
     # handshake and puts the new connection in the backlog until we accept.
-    listen_sock.listen(1)
-    print("%s: listening on %s:%s (base directory: %s)" % (progname, listenAddr or '0.0.0.0', listenPort, base_dir))
+    listen_sock.listen(128)
+    print("%s: listening on %s:%s (base directory: %s, mode: %s)" % (progname, listenAddr or '0.0.0.0', listenPort, base_dir, mode))
 
-    # Main loop: accept one client, handle it, then accept the next. Each
-    # accept() returns a *new* socket (new fd) for the connection; the
-    # listening socket stays open for more connections. This is a single-
-    # client-at-a-time design; Part 2 is to support many concurrent clients
-    # (e.g. fork() per connection or select()/poll with non-blocking I/O).
+    # ---------------- Part 2 ----------------
+    # Concurrent server design (two interchangeable modes):
+    # - mode=select: single-threaded select.select() event loop (advanced OS friendly)
+    # - mode=threads: one thread per client using handle_client()
+
+    if mode in ("thread", "threads", "t"):
+        # Thread-per-client: simplest way to support concurrent clients.
+        # The main thread just accepts; each worker thread blocks in recv_frame/read/send_frame.
+        while True:
+            conn, addr = listen_sock.accept()
+            print("Connection from", addr)
+            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            t.start()
+        return
+
+    # Default: select() single-threaded multiplexing.
+    class ConnState:
+        __slots__ = ("addr", "recv_buf", "need", "send_buf")
+
+        def __init__(self, addr):
+            self.addr = addr
+            self.recv_buf = bytearray()
+            self.need = None  # None => need 4-byte length; else need payload length bytes
+            self.send_buf = bytearray()
+
+    def _frame_bytes(payload):
+        # Match framing.send_frame(): 4-byte big-endian length prefix.
+        import struct
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        return struct.pack(">I", len(payload)) + payload
+
+    def _close_state(sock, st, inputs, outputs, states):
+        # Best-effort cleanup; used when a client disconnects or an error happens.
+        try:
+            if sock in inputs:
+                inputs.remove(sock)
+        except ValueError:
+            pass
+        try:
+            if sock in outputs:
+                outputs.remove(sock)
+        except ValueError:
+            pass
+        states.pop(sock, None)
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def _process_request(req_bytes: bytes) -> bytes:
+        msg = req_bytes.decode("utf-8", errors="replace").strip()
+        if not msg.upper().startswith("GET "):
+            return b"ERROR: Expected GET <filename>"
+        filename = msg[4:].strip()
+        if not filename:
+            return b"ERROR: Missing filename"
+        path = safe_path(filename)
+        if path is None:
+            return b"ERROR: Invalid path"
+        if not os.path.isfile(path):
+            return ("ERROR: Not a file or not found: %s" % filename).encode("utf-8")
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except OSError:
+            return b"ERROR: Could not read file"
+
+    def _try_parse_one_frame(st: ConnState):
+        # Return one complete framed payload bytes if available, else None.
+        import struct
+        if st.need is None:
+            if len(st.recv_buf) < 4:
+                return None
+            (length,) = struct.unpack(">I", bytes(st.recv_buf[:4]))
+            del st.recv_buf[:4]
+            st.need = length
+        if len(st.recv_buf) < st.need:
+            return None
+        payload = bytes(st.recv_buf[: st.need])
+        del st.recv_buf[: st.need]
+        st.need = None
+        return payload
+
+    listen_sock.setblocking(False)
+    inputs = [listen_sock]
+    outputs = []
+    states = {}
+
     while True:
-        conn, addr = listen_sock.accept()
-        print("Connection from", addr)
-        handle_client(conn, addr)
+        readable, writable, _ = select.select(inputs, outputs, [], None)
+
+        for sock in readable:
+            if sock is listen_sock:
+                # Accept all queued connections.
+                while True:
+                    try:
+                        conn, addr = listen_sock.accept()
+                    except BlockingIOError:
+                        break
+                    conn.setblocking(False)
+                    states[conn] = ConnState(addr)
+                    inputs.append(conn)
+                    print("Connection from", addr)
+                continue
+
+            st = states.get(sock)
+            if st is None:
+                continue
+
+            try:
+                chunk = sock.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                chunk = b""
+            except OSError:
+                _close_state(sock, st, inputs, outputs, states)
+                continue
+
+            if chunk == b"":
+                _close_state(sock, st, inputs, outputs, states)
+                continue
+
+            st.recv_buf.extend(chunk)
+            req = _try_parse_one_frame(st)
+            if req is not None:
+                resp_payload = _process_request(req)
+                st.send_buf = bytearray(_frame_bytes(resp_payload))
+                if sock not in outputs:
+                    outputs.append(sock)
+
+        for sock in writable:
+            st = states.get(sock)
+            if st is None:
+                continue
+
+            if not st.send_buf:
+                _close_state(sock, st, inputs, outputs, states)
+                continue
+
+            try:
+                sent = sock.send(st.send_buf)
+            except (BlockingIOError, InterruptedError):
+                sent = 0
+            except OSError:
+                _close_state(sock, st, inputs, outputs, states)
+                continue
+
+            if sent > 0:
+                del st.send_buf[:sent]
+
+            if not st.send_buf:
+                _close_state(sock, st, inputs, outputs, states)
 
 
 if __name__ == '__main__':
